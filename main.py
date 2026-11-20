@@ -7,7 +7,8 @@ Aucune dépendance externe : uniquement la bibliothèque standard Python.
 Variables d'environnement :
   GEMINI_API_KEY            (obligatoire) clé API Gemini
   DISCORD_WEBHOOK_<CAT>     un webhook par catégorie (voir CATEGORIES)
-  GEMINI_MODEL              modèle Gemini (défaut : gemini-3.8-flash)
+  GEMINI_MODEL              modèle Gemini (défaut : gemini-3.8-flash) ; accepte une liste
+                            séparée par des virgules = modèles de secours, dans l'ordre
   DRY_RUN=true              affiche au lieu d'envoyer, n'écrit pas l'historique
   ONLY=jeux,films           ne traite que ces catégories (utile pour tester)
 """
@@ -201,8 +202,9 @@ def _gemini_body(prompt, with_thinking):
     }).encode("utf-8")
 
 
-def call_gemini(prompt, api_key, retries=3):
-    url = GEMINI_URL.format(model=GEMINI_MODEL)
+def _call_model(model, prompt, api_key, retries=2):
+    """Un modèle donné, avec quelques tentatives. Lève RuntimeError s'il échoue."""
+    url = GEMINI_URL.format(model=model)
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
     with_thinking = True
 
@@ -218,7 +220,7 @@ def call_gemini(prompt, api_key, retries=3):
             return json.loads(text)["recommendations"]
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:300]
-            last_err = f"HTTP {e.code} (modèle : {GEMINI_MODEL}): {detail}"
+            last_err = f"HTTP {e.code} (modèle : {model}): {detail}"
             if e.code == 400 and with_thinking and GEMINI_THINKING_BUDGET != "":
                 # le modèle refuse le paramètre de réflexion : on réessaie sans
                 log("   ⚠️  paramètre thinking refusé (400), nouvel essai sans.")
@@ -229,10 +231,60 @@ def call_gemini(prompt, api_key, retries=3):
         except (KeyError, IndexError, json.JSONDecodeError, urllib.error.URLError, TimeoutError) as e:
             last_err = f"{type(e).__name__}: {e}"
         if attempt < retries - 1:
-            wait = 5 * (2 ** attempt)  # 5 s puis 10 s
-            log(f"   ↻ Gemini a échoué ({last_err}). Nouvelle tentative dans {wait}s...")
+            wait = 5 * (2 ** attempt)
+            log(f"   ↻ {model} a échoué ({' '.join(str(last_err).split())[:160]}). Nouvel essai dans {wait}s...")
             time.sleep(wait)
-    raise RuntimeError(f"Gemini inaccessible : {last_err}")
+    raise RuntimeError(str(last_err))
+
+
+_BAD_MODEL_WORDS = ("image", "tts", "live", "audio", "embedding", "robotics", "computer", "aqa", "veo", "imagen")
+_model_order = None  # ordre des modèles à essayer ; mémorisé pour tout le run
+
+
+def _discover_fallbacks(api_key, exclude):
+    """Demande à Google la liste des modèles « flash » disponibles pour cette clé."""
+    req = urllib.request.Request(
+        GEMINI_URL.rsplit("/models/", 1)[0] + "/models?pageSize=200",
+        headers={"x-goog-api-key": api_key},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            models = json.loads(resp.read().decode("utf-8")).get("models", [])
+    except Exception as e:
+        log(f"   ⚠️  liste des modèles indisponible ({type(e).__name__}).")
+        return []
+    names = []
+    for m in models:
+        name = m.get("name", "").removeprefix("models/")
+        if ("flash" in name and "generateContent" in m.get("supportedGenerationMethods", [])
+                and not any(w in name for w in _BAD_MODEL_WORDS) and name not in exclude):
+            names.append(name)
+    return sorted(names, reverse=True)[:3]  # les plus récents d'abord
+
+
+def call_gemini(prompt, api_key):
+    """Essaie les modèles dans l'ordre ; bascule sur un autre si le premier est saturé."""
+    global _model_order
+    if _model_order is None:
+        _model_order = [m.strip() for m in GEMINI_MODEL.split(",") if m.strip()]
+    errors, discovered = [], False
+    i = 0
+    while i < len(_model_order):
+        model = _model_order[i]
+        try:
+            result = _call_model(model, prompt, api_key)
+            if i > 0:  # on garde le modèle qui marche pour la suite du run
+                _model_order.insert(0, _model_order.pop(i))
+                log(f"   ➜ bascule sur le modèle {model} pour la suite.")
+            return result
+        except RuntimeError as e:
+            errors.append(str(e))
+            log(f"   ✗ {model} indisponible.")
+        i += 1
+        if i >= len(_model_order) and not discovered:
+            discovered = True
+            _model_order.extend(_discover_fallbacks(api_key, set(_model_order)))
+    raise RuntimeError("Gemini inaccessible : " + " | ".join(' '.join(e.split())[:200] for e in errors))
 
 
 def generate_for_category(cat, history_titles, known_norms, api_key):
