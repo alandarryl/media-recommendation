@@ -7,7 +7,7 @@ Aucune dépendance externe : uniquement la bibliothèque standard Python.
 Variables d'environnement :
   GEMINI_API_KEY            (obligatoire) clé API Gemini
   DISCORD_WEBHOOK_<CAT>     un webhook par catégorie (voir CATEGORIES)
-  GEMINI_MODEL              modèle Gemini (défaut : gemini-2.5-flash)
+  GEMINI_MODEL              modèle Gemini (défaut : gemini-3.8-flash)
   DRY_RUN=true              affiche au lieu d'envoyer, n'écrit pas l'historique
   ONLY=jeux,films           ne traite que ces catégories (utile pour tester)
 """
@@ -26,7 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 HISTORY_FILE = ROOT / "history.json"
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip() or "gemini-2.5-flash"
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.8-flash"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 HISTORY_IN_PROMPT = 300   # nb de titres récents passés à l'IA pour éviter les doublons
 PAUSE_BETWEEN_CATEGORIES = 8  # secondes (limite de requêtes/minute du palier gratuit)
