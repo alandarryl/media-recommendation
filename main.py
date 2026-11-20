@@ -206,7 +206,7 @@ def _call_model(model, prompt, api_key, retries=2):
     """Un modèle donné, avec quelques tentatives. Lève RuntimeError s'il échoue."""
     url = GEMINI_URL.format(model=model)
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
-    with_thinking = True
+    with_thinking = model not in _no_thinking  # mémorisé : on ne gaspille pas un appel par catégorie
 
     last_err = None
     for attempt in range(retries):
@@ -223,11 +223,12 @@ def _call_model(model, prompt, api_key, retries=2):
             last_err = f"HTTP {e.code} (modèle : {model}): {detail}"
             if e.code == 400 and with_thinking and GEMINI_THINKING_BUDGET != "":
                 # le modèle refuse le paramètre de réflexion : on réessaie sans
-                log("   ⚠️  paramètre thinking refusé (400), nouvel essai sans.")
+                log(f"   ⚠️  {model} refuse le paramètre thinking (400), essai sans (mémorisé).")
+                _no_thinking.add(model)
                 with_thinking = False
                 continue
-            if e.code not in (429, 500, 502, 503, 504):
-                break  # erreur non récupérable (clé invalide, modèle inconnu...)
+            if e.code not in (500, 502, 503, 504):
+                break  # inutile de réessayer : quota dépassé (429), clé invalide, modèle inconnu...
         except (KeyError, IndexError, json.JSONDecodeError, urllib.error.URLError, TimeoutError) as e:
             last_err = f"{type(e).__name__}: {e}"
         if attempt < retries - 1:
@@ -237,8 +238,11 @@ def _call_model(model, prompt, api_key, retries=2):
     raise RuntimeError(str(last_err))
 
 
-_BAD_MODEL_WORDS = ("image", "tts", "live", "audio", "embedding", "robotics", "computer", "aqa", "veo", "imagen")
-_model_order = None  # ordre des modèles à essayer ; mémorisé pour tout le run
+_BAD_MODEL_WORDS = ("image", "tts", "live", "audio", "embedding", "robotics", "computer",
+                    "aqa", "veo", "imagen", "omni")
+_model_order = None   # ordre des modèles à essayer ; mémorisé pour tout le run
+_failed = set()       # modèles en échec pendant ce run : on ne les réessaie pas à chaque catégorie
+_no_thinking = set()  # modèles qui refusent le paramètre thinking
 
 
 def _discover_fallbacks(api_key, exclude):
@@ -259,7 +263,8 @@ def _discover_fallbacks(api_key, exclude):
         if ("flash" in name and "generateContent" in m.get("supportedGenerationMethods", [])
                 and not any(w in name for w in _BAD_MODEL_WORDS) and name not in exclude):
             names.append(name)
-    return sorted(names, reverse=True)[:3]  # les plus récents d'abord
+    # versions stables d'abord (les « preview » ont souvent un quota nul), puis les plus récentes
+    return sorted(names, key=lambda n: ("preview" in n, n), reverse=False)[:4]
 
 
 def call_gemini(prompt, api_key):
@@ -267,23 +272,29 @@ def call_gemini(prompt, api_key):
     global _model_order
     if _model_order is None:
         _model_order = [m.strip() for m in GEMINI_MODEL.split(",") if m.strip()]
-    errors, discovered = [], False
-    i = 0
-    while i < len(_model_order):
-        model = _model_order[i]
+    errors, tried, discovered = [], set(), False
+    while True:
+        candidates = [m for m in _model_order if m not in _failed and m not in tried]
+        if not candidates:
+            if discovered:
+                break
+            discovered = True  # plus aucun modèle connu : on demande la liste à Google
+            _model_order.extend(_discover_fallbacks(api_key, set(_model_order)))
+            continue
+        model = candidates[0]
+        tried.add(model)
         try:
             result = _call_model(model, prompt, api_key)
-            if i > 0:  # on garde le modèle qui marche pour la suite du run
-                _model_order.insert(0, _model_order.pop(i))
+            if _model_order[0] != model:  # on garde le modèle qui marche pour la suite du run
+                _model_order.remove(model)
+                _model_order.insert(0, model)
                 log(f"   ➜ bascule sur le modèle {model} pour la suite.")
             return result
         except RuntimeError as e:
+            _failed.add(model)
             errors.append(str(e))
             log(f"   ✗ {model} indisponible.")
-        i += 1
-        if i >= len(_model_order) and not discovered:
-            discovered = True
-            _model_order.extend(_discover_fallbacks(api_key, set(_model_order)))
+    _failed.clear()  # la catégorie suivante retentera tout
     raise RuntimeError("Gemini inaccessible : " + " | ".join(' '.join(e.split())[:200] for e in errors))
 
 
