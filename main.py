@@ -26,7 +26,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 HISTORY_FILE = ROOT / "history.json"
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip() or "gemini-2.5-flash"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 HISTORY_IN_PROMPT = 300   # nb de titres récents passés à l'IA pour éviter les doublons
 PAUSE_BETWEEN_CATEGORIES = 8  # secondes (limite de requêtes/minute du palier gratuit)
@@ -206,7 +206,7 @@ def call_gemini(prompt, api_key, retries=4):
             return json.loads(text)["recommendations"]
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:300]
-            last_err = f"HTTP {e.code}: {detail}"
+            last_err = f"HTTP {e.code} (modèle : {GEMINI_MODEL}): {detail}"
             if e.code not in (429, 500, 502, 503, 504):
                 break  # erreur non récupérable (clé invalide, modèle inconnu...)
         except (KeyError, IndexError, json.JSONDecodeError, urllib.error.URLError, TimeoutError) as e:
