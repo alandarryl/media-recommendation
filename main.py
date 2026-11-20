@@ -30,6 +30,10 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.8-flash"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 HISTORY_IN_PROMPT = 300   # nb de titres récents passés à l'IA pour éviter les doublons
 PAUSE_BETWEEN_CATEGORIES = 8  # secondes (limite de requêtes/minute du palier gratuit)
+GEMINI_TIMEOUT = 60           # secondes par appel (comme dans l'ancien projet)
+MAX_RUNTIME = 600             # secondes : au-delà, les catégories restantes sont ignorées
+# "0" = pas de réflexion (beaucoup plus rapide), "" = ne pas envoyer le paramètre
+GEMINI_THINKING_BUDGET = os.getenv("GEMINI_THINKING_BUDGET", "0").strip()
 
 # --------------------------------------------------------------------------- #
 # Configuration : catégories (= salons Discord) et emplacements (= les 9 reco)
@@ -183,23 +187,31 @@ Règles strictes :
 Réponds uniquement avec le JSON demandé."""
 
 
-def call_gemini(prompt, api_key, retries=4):
-    url = GEMINI_URL.format(model=GEMINI_MODEL)
-    body = json.dumps({
+def _gemini_body(prompt, with_thinking):
+    gen = {
+        "temperature": 1.0,
+        "responseMimeType": "application/json",
+        "responseSchema": RESPONSE_SCHEMA,
+    }
+    if with_thinking and GEMINI_THINKING_BUDGET != "":
+        gen["thinkingConfig"] = {"thinkingBudget": int(GEMINI_THINKING_BUDGET)}
+    return json.dumps({
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 1.0,
-            "responseMimeType": "application/json",
-            "responseSchema": RESPONSE_SCHEMA,
-        },
+        "generationConfig": gen,
     }).encode("utf-8")
+
+
+def call_gemini(prompt, api_key, retries=3):
+    url = GEMINI_URL.format(model=GEMINI_MODEL)
     headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
+    with_thinking = True
 
     last_err = None
     for attempt in range(retries):
+        body = _gemini_body(prompt, with_thinking)
         req = urllib.request.Request(url, data=body, headers=headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=90) as resp:
+            with urllib.request.urlopen(req, timeout=GEMINI_TIMEOUT) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             parts = data["candidates"][0]["content"]["parts"]
             text = "".join(p.get("text", "") for p in parts if not p.get("thought"))
@@ -207,13 +219,19 @@ def call_gemini(prompt, api_key, retries=4):
         except urllib.error.HTTPError as e:
             detail = e.read().decode("utf-8", "replace")[:300]
             last_err = f"HTTP {e.code} (modèle : {GEMINI_MODEL}): {detail}"
+            if e.code == 400 and with_thinking and GEMINI_THINKING_BUDGET != "":
+                # le modèle refuse le paramètre de réflexion : on réessaie sans
+                log("   ⚠️  paramètre thinking refusé (400), nouvel essai sans.")
+                with_thinking = False
+                continue
             if e.code not in (429, 500, 502, 503, 504):
                 break  # erreur non récupérable (clé invalide, modèle inconnu...)
         except (KeyError, IndexError, json.JSONDecodeError, urllib.error.URLError, TimeoutError) as e:
             last_err = f"{type(e).__name__}: {e}"
-        wait = 10 * (2 ** attempt)
-        log(f"   ↻ Gemini a échoué ({last_err}). Nouvelle tentative dans {wait}s...")
-        time.sleep(wait)
+        if attempt < retries - 1:
+            wait = 5 * (2 ** attempt)  # 5 s puis 10 s
+            log(f"   ↻ Gemini a échoué ({last_err}). Nouvelle tentative dans {wait}s...")
+            time.sleep(wait)
     raise RuntimeError(f"Gemini inaccessible : {last_err}")
 
 
@@ -363,7 +381,12 @@ def main():
     failures = 0
     todo = [(k, c) for k, c in CATEGORIES.items() if not only or k in only]
 
+    started = time.monotonic()
     for idx, (key, cat) in enumerate(todo):
+        if time.monotonic() - started > MAX_RUNTIME:
+            log(f"\n⏱️  Durée max ({MAX_RUNTIME}s) dépassée : catégories restantes ignorées.")
+            failures += len(todo) - idx
+            break
         log(f"\n▶ {cat['label']}")
         webhook = os.getenv(cat["webhook_env"], "").strip()
         if not webhook and not dry:
